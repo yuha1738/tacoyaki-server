@@ -5,7 +5,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-07-28'
+export const SERVER_VERSION = '2026-07-29'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
@@ -220,8 +220,14 @@ export type TokenLayer = 'behind' | 'bg' | 'token' | 'standing'
 /** 통합 레이어 토큰의 가상 맵 id — 맵세트를 넘어 모든 맵세트에 유지되는 토큰을 이 sentinel 로 라우팅. */
 export const GLOBAL_MAP_ID = '__global__'
 
-/** 토큰/레이어 크기 상한(칸) — 서버 정규화·클라 리사이즈 UI·맵세트 가져오기가 공유(실측 최대 90×60 수용). */
-export const MAX_TOKEN_CELLS = 128
+/**
+ * 토큰/레이어 크기 상한(칸) — 서버 정규화·클라 리사이즈 UI·맵세트 가져오기가 공유.
+ * 실제 코코포리아 방 64개(오브제·마커 2706개)를 집계하니 긴 변이 최대 235칸, 필드는 320칸까지
+ * 쓰인다(128칸 초과 3.4%). 상한이 128이면 그 대형 배경 레이어들이 가져오기에서 잘려
+ * 중심만 남긴 채 작아지고, 다시 내보내도 원래 크기로 복구되지 않는다 — 실측 1125개 중 157개가
+ * 그렇게 어긋났다. 여유를 둬 512 로 잡는다(폭주 좌표 방어는 유지).
+ */
+export const MAX_TOKEN_CELLS = 512
 
 /** z순서 조정 연산. 같은 레이어 안에서 한 칸 앞/뒤(forward/backward) 또는 맨앞/맨뒤(front/back). */
 export type TokenZOp = 'front' | 'back' | 'forward' | 'backward'

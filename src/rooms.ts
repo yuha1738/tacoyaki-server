@@ -681,6 +681,25 @@ function packAvatars(messages: ChatMessage[]): { messages: ChatMessage[]; avatar
   return { messages: out, avatarPool: pool }
 }
 
+/**
+ * 이 메시지를 볼 수 있는 사람인지 — 귓속말·비밀 메시지는 당사자에게만 보인다.
+ *   공개(main/ooc)      누구나
+ *   귓속말(whisper)     보낸 사람 + 받는 사람만 (GM 도 제3자면 못 본다)
+ *   비밀(secret)        보낸 사람 + GM 만
+ *   그룹(group)         채널 접근권이 있는 사람만 — 판정은 호출 측(채널 멤버십)에 위임한다.
+ * 히스토리에 저장은 하되 '보낼 때' 반드시 이 필터를 통과시킨다(클라 은닉을 믿지 않는다).
+ */
+export function canSeeMessage(
+  m: ChatMessage,
+  viewer: { playerId: string; role: Participant['role'] },
+  canAccessGroup?: (groupId: string) => boolean
+): boolean {
+  if (m.secret) return m.playerId === viewer.playerId || viewer.role === 'GM'
+  if (m.channel === 'whisper') return m.playerId === viewer.playerId || m.to === viewer.playerId
+  if (m.channel === 'group' && m.groupId) return canAccessGroup ? canAccessGroup(m.groupId) : false
+  return true
+}
+
 /** packAvatars 역연산 — avatarRef 를 풀에서 찾아 avatar 인라인으로 복원(런타임 메시지로). */
 function unpackAvatars(messages: ChatMessage[], pool: string[]): ChatMessage[] {
   return messages.map((m): ChatMessage => {
@@ -2732,12 +2751,13 @@ export class RoomStore {
     return token
   }
 
-  /** 토큰 크기(칸, 긴 변) 변경. 0.25~128 칸으로 클램프. 보관된 토큰 없으면 undefined. 권한 검증은 호출 측(relay · 이동과 동일). */
+  /** 토큰 크기(칸, 긴 변) 변경. 0.25~캡(MAX_TOKEN_CELLS) 칸으로 클램프 — 추가(upsertToken)와 같은 상한을 쓴다
+   *  (다르면 '넣을 땐 되는데 조절하면 줄어드는' 토큰이 생긴다). 보관된 토큰 없으면 undefined. 권한 검증은 호출 측(relay · 이동과 동일). */
   resizeToken(roomId: string, mapId: string, id: string, size: number): Token | undefined {
     const room = this.rooms.get(roomId)
     const token = room ? this.tokenColl(room, mapId)?.get(id) : undefined
     if (!room || !token) return undefined
-    if (Number.isFinite(size)) token.size = Math.max(0.25, Math.min(128, size))
+    if (Number.isFinite(size)) token.size = Math.max(0.25, Math.min(MAX_TOKEN_CELLS, size))
     room.lastActivityAt = Date.now()
     return token
   }
@@ -3134,7 +3154,13 @@ export class RoomStore {
 
   /** viewer 지정 시 handouts 는 그 사람이 볼 수 있는 것만(없으면 전체 — 테스트/하위호환용). */
   snapshot(room: Room, viewer?: { playerId: string; role: Participant['role'] }): RoomState {
-    const { messages, avatarPool } = packAvatars(room.messages) // 채팅 두상 풀 분리 — 스냅샷 크기 절감
+    // 히스토리는 뷰어별로 걸러 내보낸다 — 귓속말·비밀 메시지가 제3자 스냅샷에 실리지 않게(와이어 노출 차단).
+    const visible = viewer
+      ? room.messages.filter((m) =>
+          canSeeMessage(m, viewer, (gid) => this.canAccessChannel(room.id, gid, viewer.playerId))
+        )
+      : room.messages
+    const { messages, avatarPool } = packAvatars(visible) // 채팅 두상 풀 분리 — 스냅샷 크기 절감
     return {
       id: room.id,
       code: room.code,

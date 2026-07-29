@@ -497,6 +497,24 @@ export interface AuthStore {
   ): { ok: true; accountId: string; affectedFriends: string[] } | { ok: false; error: string }
   getAccountById(id: string): PublicAccount | null
   /**
+   * 본인 비밀번호 변경 — 토큰 + 현재 비밀번호 재확인. 성공하면 이 토큰만 남기고 나머지 세션을 끊는다
+   * (비밀번호를 바꾸는 이유가 보통 '다른 기기/사람을 내보내려는 것'이라 남은 세션을 살려 두면 의미가 없다).
+   */
+  changePassword(
+    token: string,
+    current: string,
+    next: string
+  ): { ok: true; accountId: string } | { ok: false; error: string }
+  /**
+   * 관리자 이양 — 지금 관리자가 다른 계정에게 관리자를 넘기고 본인은 member 가 된다(관리자는 항상 1명).
+   * 대상은 손님이 아니어야 한다(승인부터 하고 넘기게). 서버를 연 사람이 실수로 먼저 로그인해 관리자가 된 경우를 푼다.
+   * 권한 검사(요청자=admin)는 호출 측 relay 가 수행한다.
+   */
+  transferAdmin(
+    fromId: string,
+    toId: string
+  ): { ok: true; from: PublicAccount; to: PublicAccount } | { ok: false; error: string }
+  /**
    * 관리자: 대상 계정 등급 변경(member↔guest). admin 은 부트스트랩 전용이라 대상이 admin 이거나 목표가 admin 이면 거부.
    * 권한 검사(요청자=admin)는 호출 측 relay 가 수행한다. 성공 시 갱신된 공개 계정을 반환.
    */
@@ -821,6 +839,44 @@ export function createAuthStore(opts?: {
     getAccountById(id) {
       const a = accounts.find((x) => x.id === id)
       return a ? pub(a) : null
+    },
+
+    changePassword(token, current, next) {
+      const id = accountIdForToken(token)
+      if (!id) return { ok: false, error: '로그인이 필요합니다.' }
+      const a = accounts.find((x) => x.id === id)
+      if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      // 현재 비밀번호 재확인(타이밍 세이프) — 토큰만으로는 부족(자리를 비운 사이 바꿔치기 방지).
+      const attempt = Buffer.from(hashPassword(current ?? '', a.salt), 'hex')
+      const stored = Buffer.from(a.hash, 'hex')
+      if (attempt.length !== stored.length || !timingSafeEqual(attempt, stored)) {
+        return { ok: false, error: '현재 비밀번호가 올바르지 않습니다.' }
+      }
+      const pw = typeof next === 'string' ? next : ''
+      if (pw.length < 4) return { ok: false, error: '새 비밀번호는 4자 이상이어야 합니다.' }
+      if (pw === current) return { ok: false, error: '지금 쓰는 비밀번호와 같습니다.' }
+      // 소금(salt)도 새로 뽑는다 — 옛 해시로 만든 사전 계산이 새 비밀번호에 재사용되지 않게.
+      a.salt = randomBytes(16).toString('hex')
+      a.hash = hashPassword(pw, a.salt)
+      // 지금 쓰는 세션만 남기고 나머지는 끊는다(다른 기기·다른 사람 로그아웃).
+      for (const [tok, s] of sessions) if (s.accountId === id && tok !== token) sessions.delete(tok)
+      save()
+      return { ok: true, accountId: id }
+    },
+
+    transferAdmin(fromId, toId) {
+      if (!toId || fromId === toId) return { ok: false, error: '자기 자신에게는 넘길 수 없습니다.' }
+      const from = accounts.find((x) => x.id === fromId)
+      const to = accounts.find((x) => x.id === toId)
+      if (!from || from.role !== 'admin') return { ok: false, error: '관리자만 이양할 수 있습니다.' }
+      if (!to) return { ok: false, error: '대상 계정을 찾을 수 없습니다.' }
+      if (to.role === 'guest') {
+        return { ok: false, error: '승인 대기(손님) 계정에는 넘길 수 없습니다. 먼저 멤버로 승인해 주세요.' }
+      }
+      to.role = 'admin'
+      from.role = 'member'
+      save()
+      return { ok: true, from: pub(from), to: pub(to) }
     },
 
     setRole(targetId, role) {

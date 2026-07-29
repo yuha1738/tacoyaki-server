@@ -15,7 +15,7 @@ ENV NODE_ENV=production
 # PORT 는 Railway 서비스 변수로 8787 고정(index.ts 가 process.env.PORT 사용) · 공개 도메인도 8787 로 연결.
 EXPOSE 8787
 
-# 영속 데이터(/app/data)는 Docker VOLUME 이 아니라 Railway Volume 으로 마운트한다(railway volume, mount path /app/data).
+# ⚠️ 영속 데이터(/app/data)는 Docker VOLUME 이 아니라 Railway Volume 으로 마운트한다(railway volume, mount path /app/data).
 #    Railway 빌더는 Dockerfile 의 VOLUME 지시문을 거부하므로 여기엔 두지 않는다. 스토어 기본값 <cwd>/data = /app/data 와 일치.
 
 CMD ["npm", "start"]
