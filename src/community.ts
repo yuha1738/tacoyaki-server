@@ -2,7 +2,7 @@
 // 글/댓글은 communityPost, 캐릭터는 communityChar 가 맡고, 이 파일은 그 둘이 기대는 '무엇을 할 수 있는가'를 정한다.
 //
 // 권한: 서버 계정 등급(auth 의 admin/member/guest)은 호스팅 용량 관리용 축이라 여기에 쓰지 않는다.
-//   커뮤니티는 자체 역할·멤버십 테이블을 갖고, 판정은 effective() 하나로만 한다(우회 경로를 만들지 않기 위해).
+//   커뮤니티는 자체 역할·멤버십 테이블을 갖고, 판정은 can() 하나로만 한다(우회 경로를 만들지 않기 위해).
 // 자산: 참조는 전부 이 파일이 상주로 들고 있는 구조(설정·게시판 목록) 안에만 둔다.
 //   지연 로드 파일에 참조가 숨으면 자산 GC 가 그것을 못 보고 이미지를 지운다.
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, appendFileSync, readdirSync, statSync } from 'node:fs'

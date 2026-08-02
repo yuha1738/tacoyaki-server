@@ -6,7 +6,7 @@ import { readFileSync, existsSync, readdirSync, unlinkSync, appendFileSync, writ
 import { mkdir, writeFile, rename, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { capImage, capImageList, capId, clampCoord } from './limits'
-import { collectAssetRefs as scanAssetRefs } from './assets'
+import { collectAssetRefs as scanAssetRefs, dataUrlHash } from './assets'
 import type {
   Appearance,
   BgmState,
@@ -59,6 +59,8 @@ const STUCK_FLUSH_MS = 60_000
 const MAX_HISTORY = 20000
 /** 맵당 오브젝트 개수 상한 — 방 상태 팽창 방어(coerceLoadedMap 모든 진입점 적용). */
 const MAX_TOKENS_PER_MAP = 2000
+/** 방이 들고 있는 GM 선택지 개수 상한 — 넘으면 오래된 것부터 버린다(옵션 스크립트가 무거워 무제한 불가). */
+const MAX_ROOM_CHOICES = 100
 const MAX_DRAWINGS_PER_MAP = 2000
 const MAX_TEXTS_PER_MAP = 1000
 
@@ -107,6 +109,10 @@ export interface Room {
   visualCards?: VisualCard[] // 비주얼 카드 — GM 등록·전원 동기화 · 영속
   globalTokens?: Map<string, Token> // 통합 레이어 — 맵세트를 넘어 모든 맵세트에 유지되는 토큰. key=token id · 영속
   channels: Map<string, Channel> // 그룹 채널(GM 개설·영속). key=channelId
+  /** GM 선택지 — key=선택지 메시지 id. 옵션(스크립트 포함·비공개) + 이미 응답한 사람. 영속.
+   *  영속이 아니면 서버가 한 번 재시작하는 순간 화면에 남은 선택지 카드가 전부 죽은 단추가 된다
+   *  (눌러도 서버가 모르는 선택지라 조용히 무시). 최근 MAX_ROOM_CHOICES 개만 보관. */
+  choices?: Map<string, { options: { id: string; label: string; script?: string }[]; responders: Map<string, string> }>
   messages: ChatMessage[]
   /** 방별 캐릭터 시트 멤버십 — playerId(=계정) → 이 방에 속한 charId[]. 영속. 시트 데이터는 계정 라이브러리에. */
   charRooms: Map<string, string[]>
@@ -356,7 +362,8 @@ function coerceBars(v: unknown): TokenBar[] | undefined {
       label: typeof o.label === 'string' ? o.label.slice(0, 24) || undefined : undefined,
       cur: Math.max(-1_000_000, Math.min(1_000_000, cur)),
       max: Math.max(0, Math.min(1_000_000, max)),
-      color: typeof o.color === 'string' ? o.color.slice(0, 16) || undefined : undefined
+      color: typeof o.color === 'string' ? o.color.slice(0, 16) || undefined : undefined,
+      link: o.link === 'hp' || o.link === 'mp' || o.link === 'san' ? o.link : undefined
     })
   }
   return out.length ? out : undefined
@@ -689,6 +696,27 @@ function packAvatars(messages: ChatMessage[]): { messages: ChatMessage[]; avatar
  *   그룹(group)         채널 접근권이 있는 사람만 — 판정은 호출 측(채널 멤버십)에 위임한다.
  * 히스토리에 저장은 하되 '보낼 때' 반드시 이 필터를 통과시킨다(클라 은닉을 믿지 않는다).
  */
+/**
+ * 이 방의 채팅 두상이 자산 저장소에 어떤 이름으로 들어가 있는지 모아 준다(자산 GC 라이브 집합).
+ *
+ * 두상은 방에는 data URL 로 남고, 입장 스냅샷을 보낼 때만 자산으로 내부화된다. 그래서 'asset:' 문자열만
+ * 훑는 수집기는 그 파일을 못 찾아 '아무도 안 쓴다'고 판정했다. 같은 두상이 수천 줄에 반복되므로
+ * 문자열→해시 결과를 방 단위로 기억해 두 번 계산하지 않는다.
+ */
+function collectAvatarHashes(room: Room, into: Set<string>): void {
+  const memo = new Map<string, string | null>()
+  for (const m of room.messages) {
+    const a = m.avatar
+    if (typeof a !== 'string' || !a.startsWith('data:')) continue
+    let h = memo.get(a)
+    if (h === undefined) {
+      h = dataUrlHash(a)
+      memo.set(a, h)
+    }
+    if (h) into.add(h)
+  }
+}
+
 export function canSeeMessage(
   m: ChatMessage,
   viewer: { playerId: string; role: Participant['role'] },
@@ -908,6 +936,15 @@ function roomToFile(room: Room): Record<string, unknown> {
     saveSlots: room.saveSlots ?? [], // 저장 슬롯(반면 전체 명명 저장 · 최대 3)
     visualCards: room.visualCards ?? [], // 비주얼 카드 — 이미지/음향
     globalTokens: room.globalTokens ? [...room.globalTokens.values()] : [], // 통합 레이어 토큰
+    // GM 선택지 — 재시작 뒤에도 화면에 남은 선택지 카드가 계속 눌리게(옵션 스크립트는 여기에만 있다).
+    choices: room.choices
+      ? [...room.choices].map(([mid, c]) => ({
+          mid,
+          options: c.options,
+          // 누가 무엇을 골랐는지까지 남긴다 — 고른 사람만 알면 재입장한 화면이 '무엇을 골랐는지' 못 되살린다.
+          responders: [...c.responders].map(([pid, oid]) => [pid, oid])
+        }))
+      : [],
     createdAt: room.createdAt,
     lastActivityAt: room.lastActivityAt
   }
@@ -995,12 +1032,44 @@ function roomFromFile(data: unknown): Room | null {
     saveSlots: coerceSaveSlots(o.saveSlots), // 저장 슬롯 복원(최대 3)
     visualCards: coerceVisualCards(o.visualCards), // 비주얼 카드 복원
     globalTokens: coerceGlobalTokens(o.globalTokens), // 통합 레이어 토큰 복원
+    choices: coerceChoices(o.choices), // GM 선택지 복원(옵션 스크립트·이미 응답한 사람)
     channels: coerceChannels(o.channels),
     messages,
     charRooms,
     createdAt: typeof o.createdAt === 'number' ? o.createdAt : now,
     lastActivityAt: typeof o.lastActivityAt === 'number' ? o.lastActivityAt : now
   }
+}
+
+/** GM 선택지 정규화(로드용) — 메시지 id·옵션 필수, 개수·길이 캡. 구버전 저장본엔 없음(undefined). */
+function coerceChoices(
+  v: unknown
+): Map<string, { options: { id: string; label: string; script?: string }[]; responders: Map<string, string> }> | undefined {
+  if (!Array.isArray(v) || v.length === 0) return undefined
+  const out = new Map<string, { options: { id: string; label: string; script?: string }[]; responders: Map<string, string> }>()
+  for (const raw of v as Record<string, unknown>[]) {
+    if (out.size >= MAX_ROOM_CHOICES) break
+    if (!raw || typeof raw !== 'object' || typeof raw.mid !== 'string' || !raw.mid) continue
+    const options: { id: string; label: string; script?: string }[] = []
+    for (const o of Array.isArray(raw.options) ? (raw.options as Record<string, unknown>[]) : []) {
+      if (options.length >= 10) break
+      if (!o || typeof o.id !== 'string' || !o.id || typeof o.label !== 'string') continue
+      options.push({
+        id: o.id.slice(0, 40),
+        label: o.label.slice(0, 200),
+        script: typeof o.script === 'string' && o.script ? o.script.slice(0, 4000) : undefined
+      })
+    }
+    if (!options.length) continue
+    // 구버전 저장본은 id 문자열 배열(누가 골랐는지만) — 그때는 고른 항목을 알 수 없으므로 빈 값으로 둔다.
+    const responders = new Map<string, string>()
+    for (const r of Array.isArray(raw.responders) ? raw.responders : []) {
+      if (typeof r === 'string' && r) responders.set(r, '')
+      else if (Array.isArray(r) && typeof r[0] === 'string' && r[0]) responders.set(r[0], typeof r[1] === 'string' ? r[1] : '')
+    }
+    out.set(raw.mid, { options, responders })
+  }
+  return out.size ? out : undefined
 }
 
 /** 그룹 채널 정규화(로드용) — id 필수, 이름 80·멤버 64 캡. */
@@ -1054,11 +1123,6 @@ function normalizeCombat(state: unknown): CombatState | null {
 
 export class RoomStore {
   private rooms = new Map<string, Room>() // key: roomId
-  // GM 선택지 서버 보관 — key=`${roomId}:${messageId}`. 옵션(스크립트 포함·비공개) + 응답자(1회 제한). 휘발(비영속).
-  private choices = new Map<
-    string,
-    { options: { id: string; label: string; script?: string }[]; responders: Set<string> }
-  >()
   private codeToId = new Map<string, string>() // 정규화 코드 -> roomId
   private persist: boolean
   private roomDir: string
@@ -1955,7 +2019,16 @@ export class RoomStore {
     messageId: string,
     options: { id: string; label: string; script?: string }[]
   ): void {
-    this.choices.set(`${roomId}:${messageId}`, { options, responders: new Set() })
+    const room = this.rooms.get(roomId)
+    if (!room) return
+    const map = (room.choices ??= new Map())
+    map.set(messageId, { options, responders: new Map() })
+    // 오래된 것부터 버린다 — 옵션 스크립트는 한 건에 수십 KB 까지 갈 수 있어 무제한이면 방 파일이 붓는다.
+    while (map.size > MAX_ROOM_CHOICES) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
   }
   /** 플레이어 선택 처리 — 1회만 허용. 통과 시 해당 옵션(스크립트 포함) 반환, 중복/무효면 null. */
   selectChoice(
@@ -1964,12 +2037,12 @@ export class RoomStore {
     optionId: string,
     playerId: string
   ): { option: { id: string; label: string; script?: string } } | null {
-    const c = this.choices.get(`${roomId}:${messageId}`)
+    const c = this.rooms.get(roomId)?.choices?.get(messageId)
     if (!c) return null
     if (c.responders.has(playerId)) return null // 이미 응답
     const option = c.options.find((o) => o.id === optionId)
     if (!option) return null
-    c.responders.add(playerId)
+    c.responders.set(playerId, option.id)
     return { option }
   }
 
@@ -2224,18 +2297,38 @@ export class RoomStore {
     return this.rooms.get(roomId)?.maps.get(mapId)
   }
 
-  /** 새 맵 생성. 저장본(와이어) 반환, 방 없으면 undefined. */
-  createMap(roomId: string, name?: string): GameMap | undefined {
+  /**
+   * 새 맵 생성. 저장본(와이어) + 표시 맵 목록이 바뀐 통합 토큰들을 함께 반환(방 없으면 undefined).
+   *
+   * 가져오기로 들어온 통합 레이어에는 '이 맵들에서만 보임'(mapIds)이 박혀 있다. 그래서 새 맵세트를
+   * 만들면 통합 레이어가 아무것도 안 보이는 빈 판이 나왔다 — 바로 아래 duplicateMap 은 이어받는데
+   * 여기만 빠져 있었다. 만든 사람이 보고 있던 맵에 보이던 것만 이어받는다(전부 이어받으면 서로 다른
+   * 배치를 두 번 가져온 방에서 새 맵에 두 배치가 겹쳐 쏟아진다).
+   *
+   * ⚠ 기준 맵은 부르는 쪽이 알려 준다(baseMapId). 맵 전환은 개인 뷰라 room.activeMapId 는 전원 강제
+   *   이동 때만 움직이므로, 그 값을 기준으로 삼으면 만든 사람 화면과 다른 맵에서 이어받는다 —
+   *   클라 미러는 자기 화면 기준으로 이어붙이므로 두 쪽이 서로 다른 결과를 갖게 된다.
+   */
+  createMap(roomId: string, name?: string, baseMapId?: string): { map: GameMap; touchedGlobals: Token[] } | undefined {
     const room = this.rooms.get(roomId)
     if (!room) return undefined
     const m = makeMap((name ?? '').trim() || `맵 ${room.maps.size + 1}`)
+    // 알려 준 기준 맵이 실재할 때만 쓴다(구버전 클라·잘못된 id 는 종전대로 활성 맵).
+    const base = baseMapId && room.maps.has(baseMapId) ? baseMapId : room.activeMapId
+    const touchedGlobals: Token[] = []
+    for (const t of room.globalTokens?.values() ?? []) {
+      if (t.mapIds?.includes(base)) {
+        t.mapIds = [...t.mapIds, m.id]
+        touchedGlobals.push(t)
+      }
+    }
     room.maps.set(m.id, m)
     room.lastActivityAt = Date.now()
-    return toWireMap(m)
+    return { map: toWireMap(m), touchedGlobals }
   }
 
   /** 맵세트 복제(GM 전용). 원본의 배경/바탕/그리드/토큰/드로잉/텍스트/메타를 새 맵으로 깊은 복사(토큰 등은 새 id). */
-  duplicateMap(roomId: string, mapId: string): GameMap | undefined {
+  duplicateMap(roomId: string, mapId: string): { map: GameMap; touchedGlobals: Token[] } | undefined {
     const room = this.rooms.get(roomId)
     const src = room?.maps.get(mapId)
     if (!room || !src) return undefined
@@ -2270,12 +2363,16 @@ export class RoomStore {
       m.texts.set(id, { ...tx, id })
     }
     // 표시 맵 제한 통합 토큰 — 원본 맵에 표시되던 배치는 복제 맵에서도 보이게 새 id 를 추가.
+    const touchedGlobals: Token[] = []
     for (const t of room.globalTokens?.values() ?? []) {
-      if (t.mapIds?.includes(mapId)) t.mapIds = [...t.mapIds, m.id]
+      if (t.mapIds?.includes(mapId)) {
+        t.mapIds = [...t.mapIds, m.id]
+        touchedGlobals.push(t)
+      }
     }
     room.maps.set(m.id, m)
     room.lastActivityAt = Date.now()
-    return toWireMap(m)
+    return { map: toWireMap(m), touchedGlobals }
   }
 
   /** 맵 삭제(마지막 1개는 삭제 불가). 활성 맵 삭제 시 다른 맵으로 전환. {removed,activeMapId} 반환. */
@@ -2694,9 +2791,16 @@ export class RoomStore {
       bars: Array.isArray(req.bars) ? coerceBars(req.bars) : existing?.bars,
       statsPrivate:
         req.statsPrivate === true ? true : req.statsPrivate === false ? undefined : existing?.statsPrivate,
-      // 가져오기 출처 태그·표시 맵 제한 — 편집(upsert)으로는 바뀌지 않는다(가져오기·로드에서만 부여).
+      // 가져오기 출처 태그 — 편집(upsert)으로는 바뀌지 않는다(가져오기·로드에서만 부여).
       importId: existing?.importId,
-      mapIds: existing?.mapIds,
+      // 표시 맵 제한 — null 이면 해제(모든 맵에 표시), 배열이면 그 목록, 미지정이면 기존 보존.
+      // 가져오기가 박아 둔 제한을 사람이 풀 수 있어야 한다(새 맵세트가 빈 판으로 보이던 원인).
+      mapIds:
+        req.mapIds === null
+          ? undefined
+          : Array.isArray(req.mapIds)
+            ? req.mapIds.filter((x): x is string => typeof x === 'string' && !!x).slice(0, 200)
+            : existing?.mapIds,
       // 라이브 스탠딩 — 명시값이면 적용(true=on, false=해제), 미지정이면 기존 보존.
       liveStanding:
         req.liveStanding === true ? true : req.liveStanding === false ? undefined : existing?.liveStanding,
@@ -3193,6 +3297,16 @@ export class RoomStore {
       combat: room.combat,
       channels: this.channelsFor(room, viewer),
       charRoomIds: viewer ? (room.charRooms.get(viewer.playerId) ?? []) : [], // 요청자의 이 방 시트 멤버십
+      // 이 뷰어가 이미 고른 선택지(메시지 id → 옵션 id) — 재입장해도 잠금이 되살아난다.
+      // 없으면 이미 답한 사람에게 버튼이 다시 열리고, 눌러 본 항목이 '선택했습니다'로 잘못 남는다.
+      // 값이 빈 문자열이면 '고르긴 했는데 무엇인지 모른다'(구버전 저장본)는 뜻이다.
+      choiceLocks: viewer
+        ? Object.fromEntries(
+            [...(room.choices?.entries() ?? [])]
+              .filter(([, c]) => c.responders.has(viewer.playerId))
+              .map(([mid, c]) => [mid, c.responders.get(viewer.playerId) ?? ''])
+          )
+        : {},
       saveSlots: this.slotMeta(room), // 저장 슬롯 메타(목록 표시용)
       visualCards: room.visualCards ?? [], // 비주얼 카드 목록
       // 통합 레이어 토큰 — 맵을 넘어 유지. 공개범위/양면/상태비공개 필터를 맵 토큰과 동일 적용.
@@ -3276,6 +3390,7 @@ export class RoomStore {
         const b = Buffer.byteLength(json, 'utf8')
         bytes += b
         scanAssetRefs(json, refs)
+        collectAvatarHashes(room, refs)
         list.push({ id: room.id, title: room.title, code: room.code, bytes: b })
       } catch {
         /* 직렬화 실패 방어 — 해당 방만 건너뜀 */
@@ -3290,6 +3405,7 @@ export class RoomStore {
    */
   collectAssetRefs(into: Set<string>): void {
     for (const room of this.rooms.values()) {
+      collectAvatarHashes(room, into)
       try {
         scanAssetRefs(JSON.stringify(roomToFile(room)), into)
       } catch {
@@ -3317,12 +3433,24 @@ export class RoomStore {
     }
   }
 
-  /** 멤버 본인 이전 — 이 계정이 소유한 모든 방을 영속 파일 형태(roomToFile = 전체 장면·채팅)로 내보낸다. */
+  /**
+   * 멤버 본인 이전 — 이 계정이 소유한 모든 방을 영속 파일 형태(roomToFile = 전체 장면·채팅)로 내보낸다.
+   *
+   * ⚠ 채팅은 앱 화면과 **같은 열람 규칙**(canSeeMessage)으로 거른다. 귓속말이 방 기록에 영속되면서,
+   *   방장이라도 화면에서는 볼 수 없게 막아 둔 남의 귓속말이 내보내기 파일로는 원문 그대로 빠져나갔다.
+   *   저장(roomToFile)은 그대로 전부 담아야 하므로 여기서만 걸러 낸다.
+   */
   exportOwnedBy(accountId: string): Record<string, unknown>[] {
     if (!accountId) return []
     const out: Record<string, unknown>[] = []
     for (const room of this.rooms.values()) {
-      if (room.ownerId === accountId) out.push(roomToFile(room))
+      if (room.ownerId !== accountId) continue
+      // 방 소유자는 그 방의 GM 이다(지금 접속 중이 아니어도 재입장하면 GM).
+      const viewer = { playerId: accountId, role: room.participants.get(accountId)?.role ?? ('GM' as const) }
+      const visible = room.messages.filter((m) =>
+        canSeeMessage(m, viewer, (gid) => this.canAccessChannel(room.id, gid, accountId))
+      )
+      out.push(roomToFile({ ...room, messages: visible }))
     }
     return out
   }

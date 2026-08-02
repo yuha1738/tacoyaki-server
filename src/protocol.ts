@@ -5,7 +5,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-07-29'
+export const SERVER_VERSION = '2026-08-02'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
@@ -20,6 +20,7 @@ export type MessageKind =
   | 'system'
   | 'choice'
   | 'luck'
+  | 'stat'
 
 /** 광기의 발작(CoC 7판) 굴림 결과 — 렌더러 lib/chat/types 의 MadnessRoll 과 동일 구조(미러). */
 export interface MadnessRoll {
@@ -81,6 +82,9 @@ export interface ChatMessage {
   }
   /** 행운 성공 전환 결과 카드(kind='luck'). */
   luck?: { cost: number; remaining: number; command: string }
+  /** 상태 수치 변화 기록(kind='stat') — 체력·정신력·이성 등이 얼마에서 얼마로 바뀌었는지 한 줄로 남긴다.
+   *  구버전 클라도 빈 줄로 보이지 않게 서버가 text 에 같은 내용을 평문으로 함께 실어 보낸다. */
+  stat?: { label: string; from: number; to: number; max?: number }
   /** 수정됨 표시 — 작성자/GM 이 본문을 고치면 true. */
   edited?: boolean
   /** 삭제됨 툼스톤 — GM 이 삭제하면 true(본문 제거, "삭제된 메시지"로 렌더). */
@@ -222,7 +226,7 @@ export const GLOBAL_MAP_ID = '__global__'
 
 /**
  * 토큰/레이어 크기 상한(칸) — 서버 정규화·클라 리사이즈 UI·맵세트 가져오기가 공유.
- * 실제 코코포리아 방 64개(오브제·마커 2706개)를 집계하니 긴 변이 최대 235칸, 필드는 320칸까지
+ * 외부 맵 도구가 내보낸 방 64개(오브제·마커 2706개)를 집계하니 긴 변이 최대 235칸, 필드는 320칸까지
  * 쓰인다(128칸 초과 3.4%). 상한이 128이면 그 대형 배경 레이어들이 가져오기에서 잘려
  * 중심만 남긴 채 작아지고, 다시 내보내도 원래 크기로 복구되지 않는다 — 실측 1125개 중 157개가
  * 그렇게 어긋났다. 여유를 둬 512 로 잡는다(폭주 좌표 방어는 유지).
@@ -254,7 +258,7 @@ export interface Token {
   image?: string // data URL (NPC 토큰·이미지 오브젝트)
   layer?: TokenLayer
   z?: number
-  /** 좌우 반전(이미지 토큰 미러 · /). 기본 false. */
+  /** 좌우 반전(이미지 토큰 미러). 기본 false. */
   flipX?: boolean
   /** 이름표 숨김(GM 전용 토글·전원 동기화). true 면 토큰 이름 미표시. */
   hideName?: boolean
@@ -309,6 +313,9 @@ export interface TokenBar {
   cur: number
   max: number
   color?: string
+  /** 캐릭터 시트 수치와 연동 — 지정하면 cur/max 대신 그 캐릭터의 살아 있는 값을 그린다(시트를 고치면 맵도 따라간다).
+   *  토큰에 캐릭터가 안 붙어 있거나 그 수치가 없으면 저장된 cur/max 로 되돌아간다. */
+  link?: 'hp' | 'mp' | 'san'
 }
 
 /** token:upsert 요청 (GM 전용). id 없으면 신규 생성. mapId=대상 맵. layer=배치 레이어(이미지 오브젝트). */
@@ -346,6 +353,9 @@ export interface TokenUpsertReq {
   hoverImage?: string
   pressImage?: string
   sounds?: { base?: string; hover?: string; press?: string }
+  /** 표시 맵 제한(통합 레이어 전용) — 배열이면 그 맵에서만 보임, null 이면 제한 해제(모든 맵),
+   *  미지정이면 기존 값 보존. 가져오기가 박아 둔 제한을 사람이 풀 수 있는 유일한 손잡이다. */
+  mapIds?: string[] | null
 }
 
 /** token:move 요청 (GM 또는 토큰 소유 PL). 잦은 이벤트 → 위치만 전송. mapId=대상 맵. */
@@ -607,6 +617,9 @@ export interface RoomState {
   dimColor?: string
   /** 요청자의 이 방 캐릭터 시트 멤버십 — 이 charId 들만 방에서 보임(라이브러리에서 가져온 것). */
   charRoomIds: string[]
+  /** 이 뷰어가 이미 고른 GM 선택지(메시지 id → 옵션 id). 재입장해도 잠금이 되살아난다.
+   *  값이 빈 문자열이면 '고르긴 했으나 무엇인지 모름'(구버전 저장본). 구버전 서버 응답엔 없음. */
+  choiceLocks?: Record<string, string>
   /** 저장 슬롯 메타(반면 전체 명명 저장 · 최대 3). 목록 표시용 — 맵 본문 제외. */
   saveSlots?: { id: string; name: string; savedAt: number }[]
   /** 비주얼 카드 목록 — GM 등록·전원 동기화. */
@@ -880,6 +893,8 @@ export interface ClientToServerEvents {
   'chat:roll': (req: ChatRollReq) => void
   // 행운 성공 전환 안내 — 서버가 정체성 스탬프 후 kind='luck' 카드로 브로드캐스트(공개·히스토리).
   'chat:luck': (req: { channel: ChatChannel; cost: number; remaining: number; command: string }) => void
+  // 상태 수치 변화 기록 — 시트에서 체력·정신력·이성이 바뀌면 방 기록에 한 줄 남긴다(서버가 발신자 정체성 스탬프).
+  'chat:stat': (req: { channel: ChatChannel; label: string; from: number; to: number; max?: number }) => void
   // GM 선택지 — 채팅에 버튼 선택지 게시. 서버는 옵션 스크립트를 숨기고 라벨만 브로드캐스트. 색은 그대로 전달.
   'chat:choice': (req: {
     prompt: string
@@ -889,7 +904,7 @@ export interface ClientToServerEvents {
     textColor?: string
     promptColor?: string
   }) => void
-  // 플레이어가 선택지 버튼 클릭 — 1회만. 서버: GM 비공개 통지 +(스크립트 있으면)본인 출력 + choice:locked.
+  // 선택지 버튼 클릭 — 사람당 1회(GM 포함). 서버: GM·본인에게만 보이는 통지(히스토리 저장) +(스크립트 있으면)본인 출력 + choice:locked.
   'choice:select': (req: { messageId: string; optionId: string }) => void
   // 보낸 채팅 수정/삭제. 수정=작성자 본인 또는 GM(텍스트 메시지만), 삭제=GM 만. 서버가 검증 후 브로드캐스트.
   'chat:edit': (req: { id: string; text: string }) => void
@@ -957,7 +972,9 @@ export interface ClientToServerEvents {
   'handout:delete': (req: { id: string }) => void
   'handout:focus': (req: { id: string }) => void
   // 맵·토큰 — 맵 관리·배경·그리드·배치·삭제는 GM, 이동은 GM 또는 토큰 소유 PL(서버 검증).
-  'map:create': (req: { name?: string }) => void
+  /** baseMapId: 새 맵이 통합 레이어의 '표시 맵 제한'을 이어받을 기준 맵. 맵 전환은 개인 뷰라
+   *  서버의 activeMapId 는 그 사람이 보고 있는 맵이 아니다 — 미지정이면 activeMapId 로 폴백. */
+  'map:create': (req: { name?: string; baseMapId?: string }) => void
   'map:delete': (req: { mapId: string }) => void
   'map:rename': (req: { mapId: string; name: string }) => void
   'map:activate': (req: { mapId: string }) => void
@@ -1053,7 +1070,7 @@ export type PublicPresenceStatus = 'online' | 'away' | 'session'
 /** 로비 알림 종류 — comment=내 블로그 글 댓글, reply=내 댓글 답글, guestbook=홈/로비 방명록,
  *  dtguestbook=도트타운 마이룸 방명록, friend=친구 신청/수락, dm=새 다이렉트 메시지(상대별 최신 1건). */
 // 커뮤니티 알림은 종류를 하나로 두고 세부는 본문에 담는다 — 이름이 갈리면 딥링크가 런타임에만 깨진다.
-export type NotifKind = 'comment' | 'reply' | 'guestbook' | 'dtguestbook' | 'friend' | 'dm' | 'cmty'
+export type NotifKind = 'comment' | 'reply' | 'guestbook' | 'dtguestbook' | 'friend' | 'dm' | 'cmty' | 'signup'
 /** 로비 알림 1건 — 서버 notifications 저장 항목과 동일(읽음은 서버 권위). */
 export interface NotifItem {
   id: string

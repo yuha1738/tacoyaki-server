@@ -154,16 +154,19 @@ function runAssetGc(): void {
     sessionLogStore.collectAssetRefs(live)
     dottownStore.collectAssetRefs(live)
     economyStore.collectAssetRefs(live)
-    marketStore.collectAssetRefs(live)
+    marketStore.collectAssetRefs(live) // ⚠마켓 이미지(등록·보유) — 주기 GC 회수 방지
     communityStore.collectAssetRefs(live)
     communityPostStore.collectAssetRefs(live)
-    communityCharStore.collectAssetRefs(live) // ⚠커뮤니티 이미지 — 안 실으면 최대 6시간 뒤 사라진다 // ⚠UGC 마켓 이미지(등록/보유) — 주기 GC 회수 방지
+    communityCharStore.collectAssetRefs(live) // ⚠커뮤니티 이미지 — 안 실으면 최대 6시간 뒤 사라진다
     communityCatalog.collectAssetRefs(live) // ⚠아이템 그림·상점 배너
     communityGifts.collectAssetRefs(live) // ⚠보내는 중인 선물의 편지 그림
     communityGames.collectAssetRefs(live) // ⚠퀘스트 배너·완료 카드·장면 그림
-    const { removed, freed } = assetStore.sweep(live)
-    if (removed) {
-      console.log(`[assets] 고아 자산 ${removed}개 정리 · ${(freed / 1024 / 1024).toFixed(1)}MB 확보 (참조 ${live.size}개 보존)`)
+    const { removed, freed, deferred, failed } = assetStore.sweep(live)
+    if (removed || failed) {
+      console.log(
+        `[assets] 고아 자산 ${removed}개 정리 · ${(freed / 1024 / 1024).toFixed(1)}MB 확보 ` +
+          `(참조 ${live.size}개 보존 · 유예 ${deferred}개 · 실패 ${failed}개)`
+      )
     }
   } catch (e) {
     console.error('[assets] 자산 GC 실패:', e)

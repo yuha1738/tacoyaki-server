@@ -36,10 +36,11 @@ const ASSET_REF_RE = /^asset:[a-f0-9]{64}$/
  * 참조는 그대로 통과(GET /asset 가 서빙·collectAssetRefs 가 GC 보존), data URL 은 기존처럼 검증·길이 캡.
  * 그 외 문자열은 거부(CSS 주입 방지).
  */
-function lobbyImageRef(v: unknown, maxLen: number): string | undefined {
+function lobbyImageRef(v: unknown, maxLen: number, audio = false): string | undefined {
   if (typeof v !== 'string' || !v) return undefined
   if (ASSET_REF_RE.test(v)) return v
-  return /^data:image\/[a-z0-9.+-]+[;,]/i.test(v) ? v.slice(0, maxLen) : undefined
+  const re = audio ? /^data:audio\/[a-z0-9.+-]+[;,]/i : /^data:image\/[a-z0-9.+-]+[;,]/i
+  return re.test(v) ? v.slice(0, maxLen) : undefined
 }
 
 /** 프로필 색 테마 정규화 — 모든 값 hex 검증. 전부 비면 undefined(제거). */
@@ -129,6 +130,9 @@ export interface LobbyDDayItem {
 export interface LobbyCalEvent {
   text: string
   color: string
+  /** 반복 주기·종료일 — 방문자 달력도 회차를 펼쳐 그린다. 구버전 스냅샷엔 없음. */
+  repeat?: 'weekly' | 'biweekly' | 'monthly' | 'yearly'
+  repeatUntil?: string
 }
 /** 공개 스티커 1개 — 바탕화면에 자유 배치한 이미지 장식(테두리·그림자 옵션). 방문 시 읽기전용 렌더. */
 export interface LobbySticker {
@@ -144,8 +148,30 @@ export interface LobbySticker {
   borderWidth: number
   /** 그림자 on/off. */
   shadow: boolean
+  /** 기울기(도, -180~180). 구버전 스냅샷엔 없음 → 0으로 본다. */
+  rot?: number
   /** 스티커 이미지(asset 참조 또는 data URL). 없으면 스티커 자체가 무의미 → sanitize 가 제외. */
   image?: string
+}
+/** 공개 스냅샷에 실리는 로비 위젯 창 1개의 배치(열림·좌표·크기·겹침·최소화).
+ *  기기 로컬이던 배치를 계정에 실어 다른 기기(웹판·폰)에서도 같은 자리로 되살린다. */
+export interface LobbyWin {
+  open: boolean
+  x: number
+  y: number
+  w: number
+  h: number
+  z: number
+  min: boolean
+}
+/** 로비 음악 1곡 — 오디오(src)는 공개 스냅샷에 싣지 않고 본인만 받는 별도 보관함에 둔다.
+ *  공개 스냅샷에 넣으면 방문자가 남의 음원을 통째로 내려받게 되고, 참조만 알면 누구나 /asset 으로
+ *  원본을 가져갈 수 있다. */
+export interface LobbyMusicTrack {
+  title: string
+  cover?: string
+  /** 오디오 'asset:<해시>' 참조(또는 data URL). 본인 조회에서만 응답에 실린다. */
+  src: string
 }
 /** 사용자가 공개(동기화)한 로비 스냅샷 — 다른 사람이 '로비 방문' 시 이 데이터로 읽기전용 렌더. */
 export interface LobbySnapshot {
@@ -168,6 +194,8 @@ export interface LobbySnapshot {
   hiddenIcons?: Record<string, boolean>
   /** 바탕화면 스티커(그리는 순서 = 배열 순서 = 겹침 순서). */
   stickers: LobbySticker[]
+  /** 위젯 창 배치(위젯키 → 창 상태). 구버전 스냅샷엔 없음 → 복원 시 옵셔널 처리. */
+  widgets?: Record<string, LobbyWin>
   updatedAt: number
 }
 
@@ -188,6 +216,11 @@ const MAX_LOBBY_CAL_TEXT = 200 // 일정 텍스트 길이 상한
 const MAX_LOBBY_STICKERS = 60 // 스티커 개수 상한
 const MAX_LOBBY_STICKER = 600_000 // 스티커 이미지 1개 상한
 const MAX_LOBBY_STICKER_TOTAL = 6_000_000 // 스티커 이미지 합계 상한(accounts.json 비대화·본문 한도 방지)
+const MAX_LOBBY_WIDGETS = 40 // 위젯 창 개수 상한(위젯 종류 수보다 넉넉히)
+const MAX_LOBBY_MUSIC_SRC = 40_000_000 // 음원 참조 1개 상한 — 'asset:<해시>' 면 74자, data URL 폴백만 커진다
+// 오디오 합계 상한. 참조로 올라오면 200곡이라도 15KB 남짓이라 걸리지 않고, data URL 폴백만 잘린다.
+// 계정 파일은 전 계정 공용 한 벌이라, 여기에 박힌 바이트는 이후 모든 저장에서 매번 다시 쓰인다.
+const MAX_LOBBY_MUSIC_SRC_TOTAL = 4_000_000
 
 /** 로비 스냅샷 정규화 — 색은 hex, 이미지는 data:image(길이 캡), 텍스트/개수 캡. CSS·저장 주입 방지. */
 /** 스냅샷에 실제로 실린 그림 수 — 통째로 빠진 사본이 멀쩡한 것을 덮지 않게 가르는 데 쓴다. */
@@ -328,7 +361,15 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
         if (!ev || typeof ev !== 'object') continue
         const text = typeof ev.text === 'string' ? ev.text.slice(0, MAX_LOBBY_CAL_TEXT) : ''
         if (!text.trim()) continue
-        list.push({ text, color: hexColor(ev.color) ?? '#5bbd7a' })
+        const rep = ev.repeat
+        list.push({
+          text,
+          color: hexColor(ev.color) ?? '#5bbd7a',
+          // 반복 주기·종료일 — 화이트리스트라 여기 없는 값은 조용히 사라진다(방문자 달력이 회차를 못 그린다).
+          repeat: rep === 'weekly' || rep === 'biweekly' || rep === 'monthly' || rep === 'yearly' ? rep : undefined,
+          repeatUntil:
+            typeof ev.repeatUntil === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ev.repeatUntil) ? ev.repeatUntil : undefined
+        })
       }
       if (list.length) calEvents[k] = list
     }
@@ -354,8 +395,27 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
         borderColor: hexColor(st.borderColor) ?? '#ffffff',
         borderWidth: stickerNum(st.borderWidth, 0, 40, 0),
         shadow: st.shadow !== false, // 기본 켬(명시적 false 일 때만 끔)
+        rot: stickerNum(st.rot, -180, 180, 0),
         image
       })
+    }
+  }
+  // 위젯 창 배치 — 숫자 clamp(화면 밖으로 달아나도 되살릴 수 있는 범위). 이미지가 없어 예산 영향 없음.
+  const widgets: Record<string, LobbyWin> = {}
+  if (o.widgets && typeof o.widgets === 'object') {
+    for (const [k, val] of Object.entries(o.widgets as Record<string, unknown>)) {
+      if (Object.keys(widgets).length >= MAX_LOBBY_WIDGETS) break
+      const w = val as Record<string, unknown>
+      if (!w || typeof w !== 'object') continue
+      widgets[k.slice(0, 40)] = {
+        open: w.open === true,
+        x: stickerNum(w.x, -4000, 20000, 0),
+        y: stickerNum(w.y, -4000, 20000, 0),
+        w: stickerNum(w.w, 0, 8000, 0),
+        h: stickerNum(w.h, 0, 8000, 0),
+        z: stickerNum(w.z, 0, 100000, 1),
+        min: w.min === true
+      }
     }
   }
   return {
@@ -373,8 +433,61 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
     iconSizes,
     hiddenIcons,
     stickers,
+    widgets,
     updatedAt: Date.now()
   }
+}
+
+/**
+ * 이 스냅샷이 '아무것도 없는 판'인가 — 자동 발행이 남의 화면에 보이던 로비를 지우는 것을 막는 판정.
+ * 위젯 배치는 보지 않는다. 새 기기는 기본 배치를 그대로 갖고 있어서, 그것까지 '내용'으로 치면
+ * 빈 웹 브라우저 하나가 그대로 서버 사본을 덮는다.
+ */
+function lobbySnapshotIsBlank(l: LobbySnapshot): boolean {
+  return (
+    countLobbyImages(l) === 0 &&
+    !(l.memoText ?? '').trim() &&
+    (l.gallery ?? []).length === 0 &&
+    (l.ddays ?? []).length === 0 &&
+    (l.stickers ?? []).length === 0 &&
+    (l.music ?? []).length === 0 &&
+    Object.keys(l.calEvents ?? {}).length === 0 &&
+    Object.keys(l.colors ?? {}).length === 0 &&
+    Object.keys(l.iconEmojis ?? {}).length === 0 &&
+    Object.keys(l.iconLabels ?? {}).length === 0 &&
+    Object.keys(l.iconSizes ?? {}).length === 0 &&
+    Object.keys(l.hiddenIcons ?? {}).length === 0 &&
+    Object.keys(l.iconPos ?? {}).length === 0 &&
+    !(l.wallpaper?.color ?? '')
+  )
+}
+
+/** 로비 음악 보관함 정규화 — 오디오는 참조(또는 data URL) 1개당 상한, 개수는 공개 목록과 같은 캡. */
+function sanitizeLobbyMusic(v: unknown): LobbyMusicTrack[] | null {
+  if (!Array.isArray(v)) return null
+  const out: LobbyMusicTrack[] = []
+  let coverBudget = MAX_LOBBY_COVER_TOTAL
+  let srcBudget = MAX_LOBBY_MUSIC_SRC_TOTAL
+  for (const raw of v as Record<string, unknown>[]) {
+    if (out.length >= MAX_LOBBY_MUSIC) break
+    if (!raw || typeof raw !== 'object') continue
+    const src = lobbyImageRef(raw.src, MAX_LOBBY_MUSIC_SRC, true)
+    if (!src) continue // 오디오 없는 항목은 보관함에 둘 이유가 없다(제목만은 공개 스냅샷 music 이 담당)
+    // 합계 예산 — 참조('asset:<해시>')는 74자라 사실상 걸리지 않고, data URL 폴백만 걸린다.
+    // 이게 없으면 한 번의 요청으로 수십 MB 짜리 base64 오디오가 전 계정 공용 파일에 박히고,
+    // 그 뒤로는 계정 정보를 저장할 때마다 그만큼을 매번 다시 쓴다.
+    if (src.length > srcBudget) continue
+    srcBudget -= src.length
+    const title = typeof raw.title === 'string' ? raw.title.slice(0, 200) : ''
+    const cover = lobbyImageRef(raw.cover, MAX_LOBBY_COVER)
+    if (cover && cover.length <= coverBudget) {
+      coverBudget -= cover.length
+      out.push({ title, cover, src })
+    } else {
+      out.push({ title, src })
+    }
+  }
+  return out
 }
 
 export interface Account {
@@ -402,6 +515,8 @@ export interface Account {
   guestbook?: GuestbookEntry[]
   /** 공개(동기화)한 로비 꾸밈 스냅샷 — 타인 '로비 방문' 시 사용. */
   lobby?: LobbySnapshot
+  /** 로비 음악 보관함(오디오 참조 포함) — 본인 기기 사이에서만 오간다. 방문자 응답에는 절대 싣지 않는다. */
+  lobbyMusic?: LobbyMusicTrack[]
   /** 친구(상호 수락) userId 목록. */
   friends?: string[]
   /** 나에게 온 친구 신청(상대 userId). */
@@ -562,6 +677,8 @@ export interface AuthStore {
   getStatus(accountId: string): PresenceStatus | undefined
   /** 갠홈 둘러보기 — 전체 사용자 공개 요약(닉네임순). */
   listUsers(): UserSummary[]
+  /** 관리자 계정 id 목록 — 새 가입 알림처럼 '서버장에게만' 보내야 하는 곳에서 쓴다. */
+  adminIds(): string[]
   /** 타인/내 갠홈 보기 — 공개 프로필 + 방명록. 없는 id 면 null. */
   getHome(userId: string): HomeView | null
   /** 방명록 글 남기기 — 토큰 인증(작성자). 대상 홈에 추가 후 갱신된 방명록 반환. */
@@ -573,9 +690,13 @@ export interface AuthStore {
    * refCount 는 보내는 기기가 '가지고 있다고 아는 그림 수'다. 그림이 하나도 안 실린 사본이 왔는데
    * 그 기기가 그림을 가지고 있다고 말하면, 읽지 못했을 뿐이므로 덮지 않는다.
    */
-  setLobby(token: string, snapshot: unknown, refCount?: number): LobbyResult
+  setLobby(token: string, snapshot: unknown, refCount?: number, explicitEmpty?: boolean): LobbyResult
   /** 타인/내 로비 스냅샷 조회(공개). 없으면 null. */
   getLobby(userId: string): LobbySnapshot | null
+  /** 내 로비 음악 보관함 저장(오디오 참조 포함) — 토큰 인증. 손님 거부. */
+  setLobbyMusic(token: string, tracks: unknown, opts?: { explicitEmpty?: boolean }): LobbyResult
+  /** 내 로비 음악 보관함 조회 — 본인만(토큰). 인증 실패면 null(방문자에게는 열지 않는다). */
+  getLobbyMusic(token: string): LobbyMusicTrack[] | null
   /** 전 계정(아바타·배너·로비 스냅샷 등)에서 참조 중인 'asset:<해시>' 수집(자산 GC 라이브 집합). */
   collectAssetRefs(into: Set<string>): void
   /** 진단/테스트용. */
@@ -1086,6 +1207,10 @@ export function createAuthStore(opts?: {
       return accounts.find((x) => x.id === accountId)?.status
     },
 
+    adminIds() {
+      return accounts.filter((a) => a.role === 'admin').map((a) => a.id)
+    },
+
     listUsers() {
       return accounts
         .map((a) => ({ id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar }))
@@ -1138,7 +1263,7 @@ export function createAuthStore(opts?: {
       return { ok: true, guestbook: target.guestbook }
     },
 
-    setLobby(token, snapshot, refCount) {
+    setLobby(token, snapshot, refCount, explicitEmpty) {
       const id = accountIdForToken(token)
       if (!id) return { ok: false, error: '로그인이 필요합니다.' }
       const a = accounts.find((x) => x.id === id)
@@ -1151,6 +1276,12 @@ export function createAuthStore(opts?: {
       if (a.lobby && countLobbyImages(a.lobby) > 0 && countLobbyImages(clean) === 0 && refCount !== 0) {
         return { ok: false, error: '그림이 빠진 로비로 덮을 수 없습니다. 그림이 제대로 보이는 기기에서 보내 주세요.' }
       }
+      // 내용이 하나도 없는 판이 왔다. 위 가드는 '그림이 있던 로비'만 지키므로, 글·디데이·일정만 있던
+      // 로비는 그대로 통과해 지워졌다(막 로그인한 빈 기기가 5초 뒤 자동으로 올린다).
+      // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀을 때만(explicitEmpty) 비우기를 허용한다.
+      if (a.lobby && !lobbySnapshotIsBlank(a.lobby) && lobbySnapshotIsBlank(clean) && !explicitEmpty) {
+        return { ok: false, error: '내용이 비어 있는 로비로 덮을 수 없습니다. 비우려면 설정에서 직접 보내 주세요.' }
+      }
       a.lobby = clean
       save()
       return { ok: true }
@@ -1159,6 +1290,31 @@ export function createAuthStore(opts?: {
     getLobby(userId) {
       const a = accounts.find((x) => x.id === userId)
       return a?.lobby ?? null
+    },
+
+    setLobbyMusic(token, tracks, opts) {
+      const id = accountIdForToken(token)
+      if (!id) return { ok: false, error: '로그인이 필요합니다.' }
+      const a = accounts.find((x) => x.id === id)
+      if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      if (a.role === 'guest') return { ok: false, error: '손님 계정은 로비를 꾸밀 수 없습니다.' }
+      const clean = sanitizeLobbyMusic(tracks)
+      if (!clean) return { ok: false, error: '잘못된 음악 목록입니다.' }
+      // 보관함을 통째로 비우는 요청은 목록이 있던 계정에서 막는다 — 음원이 아직 없는 기기(웹판 첫 로그인)가
+      // 목록만 보고 빈 배열을 올리면 다른 기기의 음원 사본까지 사라진다.
+      // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀을 때만(explicitEmpty) 비우기를 허용한다 —
+      // 그 길이 없으면 한 번 올린 곡은 서버에서 영영 지울 수 없고, 지운 곡이 새 기기에서 되살아난다.
+      if (clean.length === 0 && (a.lobbyMusic?.length ?? 0) > 0 && !opts?.explicitEmpty) return { ok: true }
+      a.lobbyMusic = clean
+      save()
+      return { ok: true }
+    },
+
+    getLobbyMusic(token) {
+      const id = accountIdForToken(token)
+      if (!id) return null // 본인만 — 방문자에게 음원을 내주지 않는다
+      const a = accounts.find((x) => x.id === id)
+      return a?.lobbyMusic ?? []
     },
 
     collectAssetRefs(into) {
