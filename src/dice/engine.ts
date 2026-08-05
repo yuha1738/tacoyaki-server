@@ -174,7 +174,7 @@ export interface SumOpts {
 /** 단순 합산 굴림 (피해/혼합 등) */
 export function rollSum(expr: string, opts: SumOpts = {}): SumResult {
   const { rolls, modifier, total } = rollExpr(expr, opts.rng ?? defaultRng)
-  return { kind: 'sum', command: opts.command ?? expr, rolls, modifier, total }
+  return { kind: 'sum', command: opts.command ?? expr, expr, rolls, modifier, total }
 }
 
 /**
@@ -211,7 +211,9 @@ export function rollSan(target: number, lossExpr: string, opts: SanOpts = {}): S
   const success = roll <= target || roll === 1
   const [sExpr, fExpr] = lossExpr.split('/')
   const expr = success ? sExpr : (fExpr ?? sExpr)
-  const loss = rollExpr(expr, rng).total
+  // 굴린 눈을 함께 남긴다 — 1d6 손실은 합계만 보면 무엇이 나왔는지 알 수 없다.
+  const lossRoll = rollExpr(expr, rng)
+  const loss = lossRoll.total
   return {
     kind: 'san',
     command: opts.command ?? `SC ${lossExpr}<=${target}`,
@@ -220,6 +222,7 @@ export function rollSan(target: number, lossExpr: string, opts: SanOpts = {}): S
     level,
     success,
     loss,
+    ...(lossRoll.rolls.length ? { lossRolls: lossRoll.rolls } : {}),
     lossExpr
   }
 }

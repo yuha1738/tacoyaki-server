@@ -173,6 +173,21 @@ export interface LobbyMusicTrack {
   /** 오디오 'asset:<해시>' 참조(또는 data URL). 본인 조회에서만 응답에 실린다. */
   src: string
 }
+/** 세션 BGM 라이브러리 1곡 — 기기(IndexedDB)에 있던 목록을 계정에 얹어 웹·프로그램이 같은 목록을 본다.
+ *  로비 음악과 마찬가지로 본인만 조회할 수 있다(방문자에게 내주지 않는다). */
+export interface BgmLibraryTrack {
+  title: string
+  /** file=오디오 · youtube=영상 id */
+  kind: 'file' | 'youtube'
+  /** file 은 'asset:<해시>' 참조(또는 data URL 폴백), youtube 는 영상 id. */
+  src: string
+  loop: boolean
+  volume?: number
+  size?: number
+  /** 소속 세션방 id — 없으면 모든 방에서 보이는 공용 트랙. */
+  roomId?: string
+  createdAt: number
+}
 /** 사용자가 공개(동기화)한 로비 스냅샷 — 다른 사람이 '로비 방문' 시 이 데이터로 읽기전용 렌더. */
 export interface LobbySnapshot {
   colors: Record<string, string>
@@ -490,6 +505,46 @@ function sanitizeLobbyMusic(v: unknown): LobbyMusicTrack[] | null {
   return out
 }
 
+/** 세션 BGM 라이브러리 정규화 — 로비 음악과 같은 예산·상한을 쓴다(계정 파일이 통째로 커지는 것을 막는다). */
+function sanitizeBgmLibrary(v: unknown): BgmLibraryTrack[] | null {
+  if (!Array.isArray(v)) return null
+  const out: BgmLibraryTrack[] = []
+  let srcBudget = MAX_LOBBY_MUSIC_SRC_TOTAL
+  for (const raw of v as Record<string, unknown>[]) {
+    if (out.length >= MAX_LOBBY_MUSIC) break
+    if (!raw || typeof raw !== 'object') continue
+    const kind = raw.kind === 'youtube' ? 'youtube' : 'file'
+    // 유튜브는 영상 id 라 짧다 — 오디오 참조에만 합계 예산을 매긴다.
+    const src =
+      kind === 'youtube'
+        ? typeof raw.src === 'string' && raw.src.trim()
+          ? raw.src.trim().slice(0, 64)
+          : undefined
+        : lobbyImageRef(raw.src, MAX_LOBBY_MUSIC_SRC, true)
+    if (!src) continue
+    if (kind === 'file') {
+      if (src.length > srcBudget) continue
+      srcBudget -= src.length
+    }
+    const size = typeof raw.size === 'number' && Number.isFinite(raw.size) ? Math.max(0, Math.floor(raw.size)) : undefined
+    const volume = typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : undefined
+    const roomId = typeof raw.roomId === 'string' && raw.roomId ? raw.roomId.slice(0, 64) : undefined
+    const createdAt =
+      typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? Math.floor(raw.createdAt) : Date.now()
+    out.push({
+      title: typeof raw.title === 'string' ? raw.title.slice(0, 200) : '',
+      kind,
+      src,
+      loop: raw.loop === true,
+      ...(volume === undefined ? {} : { volume }),
+      ...(size === undefined ? {} : { size }),
+      ...(roomId === undefined ? {} : { roomId }),
+      createdAt
+    })
+  }
+  return out
+}
+
 export interface Account {
   id: string
   username: string
@@ -517,6 +572,8 @@ export interface Account {
   lobby?: LobbySnapshot
   /** 로비 음악 보관함(오디오 참조 포함) — 본인 기기 사이에서만 오간다. 방문자 응답에는 절대 싣지 않는다. */
   lobbyMusic?: LobbyMusicTrack[]
+  /** 세션 BGM 라이브러리 보관함 — 웹·프로그램이 같은 음원 목록을 보게 한다(본인만 조회). */
+  bgmLibrary?: BgmLibraryTrack[]
   /** 친구(상호 수락) userId 목록. */
   friends?: string[]
   /** 나에게 온 친구 신청(상대 userId). */
@@ -697,6 +754,10 @@ export interface AuthStore {
   setLobbyMusic(token: string, tracks: unknown, opts?: { explicitEmpty?: boolean }): LobbyResult
   /** 내 로비 음악 보관함 조회 — 본인만(토큰). 인증 실패면 null(방문자에게는 열지 않는다). */
   getLobbyMusic(token: string): LobbyMusicTrack[] | null
+  /** 세션 BGM 라이브러리 보관함 저장(본인만). 비우기는 사람이 직접 누른 경우만(explicitEmpty). */
+  setBgmLibrary(token: string, tracks: unknown, opts?: { explicitEmpty?: boolean }): LobbyResult
+  /** 세션 BGM 라이브러리 보관함 조회 — 본인만(토큰 없으면 null). */
+  getBgmLibrary(token: string): BgmLibraryTrack[] | null
   /** 전 계정(아바타·배너·로비 스냅샷 등)에서 참조 중인 'asset:<해시>' 수집(자산 GC 라이브 집합). */
   collectAssetRefs(into: Set<string>): void
   /** 진단/테스트용. */
@@ -1315,6 +1376,28 @@ export function createAuthStore(opts?: {
       if (!id) return null // 본인만 — 방문자에게 음원을 내주지 않는다
       const a = accounts.find((x) => x.id === id)
       return a?.lobbyMusic ?? []
+    },
+
+    setBgmLibrary(token, tracks, opts) {
+      const id = accountIdForToken(token)
+      if (!id) return { ok: false, error: '로그인이 필요합니다.' }
+      const a = accounts.find((x) => x.id === id)
+      if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      if (a.role === 'guest') return { ok: false, error: '손님 계정은 음원 보관함을 쓸 수 없습니다.' }
+      const clean = sanitizeBgmLibrary(tracks)
+      if (!clean) return { ok: false, error: '잘못된 음원 목록입니다.' }
+      // 로비 음악과 같은 방어 — 아직 목록을 못 받은 기기가 빈 배열을 올려 다른 기기의 음원을 지우지 못하게.
+      if (clean.length === 0 && (a.bgmLibrary?.length ?? 0) > 0 && !opts?.explicitEmpty) return { ok: true }
+      a.bgmLibrary = clean
+      save()
+      return { ok: true }
+    },
+
+    getBgmLibrary(token) {
+      const id = accountIdForToken(token)
+      if (!id) return null // 본인만 — 남의 음원을 내주지 않는다
+      const a = accounts.find((x) => x.id === id)
+      return a?.bgmLibrary ?? []
     },
 
     collectAssetRefs(into) {

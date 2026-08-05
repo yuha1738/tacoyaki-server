@@ -5,7 +5,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-08-02'
+export const SERVER_VERSION = '2026-08-05'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
@@ -172,6 +172,13 @@ export interface SharedCharacter {
 
 /** char:update 요청 — playerId 는 서버가 소켓에서 스탬프(위조 방지)하므로 클라는 제외. */
 export type CharUpdateReq = Omit<SharedCharacter, 'playerId'>
+
+/**
+ * char:identity 요청 — 스탠딩을 뺀 '누구로 말하는가'만 담은 가벼운 발행.
+ * 스탠딩은 대형 이미지라 자산 업로드를 기다렸다 나가는데, 그 사이 친 말은 옛 정체성으로 각인된다.
+ * 그래서 업로드가 필요 없는 것만 먼저 보내 이름·색·두상을 즉시 맞추고, 스탠딩은 뒤이은 char:update 가 채운다.
+ */
+export type CharIdentityReq = Omit<CharUpdateReq, 'standings'>
 
 /**
  * 계정 영속용 캐릭터 시트 "전체". 서버는 내용을 해석하지 않고 불투명 블롭으로 저장 —
@@ -564,8 +571,8 @@ export interface CombatState {
 }
 
 /**
- * 그룹 채널(GM 개설) — members(+GM)에게만 보이고 전달됨. 채널 자체는 영속,
- * 메시지는 휘발(귓속말처럼 공유 히스토리 미저장). 클라 protocol 과 미러.
+ * 그룹 채널(GM 개설) — members(+GM)에게만 보이고 전달됨. 채널과 메시지 모두 영속이며,
+ * 귓속말과 같이 히스토리에 저장하되 내보낼 때 뷰어별로 거른다(재입장 보존). 클라 protocol 과 미러.
  */
 export interface Channel {
   id: string
@@ -892,7 +899,7 @@ export interface ClientToServerEvents {
   // 클라가 굴린 결과(시트 주사위·광기) 중계 — 서버가 정체성 스탬프·라우팅·히스토리·브로드캐스트.
   'chat:roll': (req: ChatRollReq) => void
   // 행운 성공 전환 안내 — 서버가 정체성 스탬프 후 kind='luck' 카드로 브로드캐스트(공개·히스토리).
-  'chat:luck': (req: { channel: ChatChannel; cost: number; remaining: number; command: string }) => void
+  'chat:luck': (req: { channel: ChatChannel; groupId?: string; cost: number; remaining: number; command: string }) => void
   // 상태 수치 변화 기록 — 시트에서 체력·정신력·이성이 바뀌면 방 기록에 한 줄 남긴다(서버가 발신자 정체성 스탬프).
   'chat:stat': (req: { channel: ChatChannel; label: string; from: number; to: number; max?: number }) => void
   // GM 선택지 — 채팅에 버튼 선택지 게시. 서버는 옵션 스크립트를 숨기고 라벨만 브로드캐스트. 색은 그대로 전달.
@@ -913,6 +920,8 @@ export interface ClientToServerEvents {
   'chat:typing': (req: { typing: boolean; channel?: ChatChannel; groupId?: string }) => void
   // 캐릭터 프레즌스 공유. playerId 는 서버가 스탬프.
   'char:update': (req: CharUpdateReq) => void
+  // 스탠딩을 뺀 정체성만 즉시 반영(업로드 대기 없음) — 갈아입자마자 친 말이 옛 캐릭터로 찍히지 않게.
+  'char:identity': (req: CharIdentityReq) => void
   'char:expr': (req: { index: number }) => void
   // 캐릭터 시트 영속 (인증 계정 전용). 시트 전체를 계정에 저장/삭제.
   'char:save': (req: CharacterRecord) => void

@@ -2082,7 +2082,16 @@ export class RoomStore {
     const room = this.rooms.get(roomId)
     if (!room) return false
     const had = room.channels.delete(id)
-    if (had) room.lastActivityAt = Date.now()
+    if (had) {
+      // 그룹 대화도 함께 지운다 — 채널이 없으면 열람 권한을 판정할 근거가 사라져 GM 조차 다시 볼 수 없다.
+      // 남겨 두면 아무도 못 보는 기록이 방 저장본에만 계속 쌓인다.
+      const gone = room.messages.filter((m) => m.channel === 'group' && m.groupId === id)
+      if (gone.length) {
+        room.messages = room.messages.filter((m) => !(m.channel === 'group' && m.groupId === id))
+        for (const m of gone) this.journal(roomId, { op: 'del', id: m.id })
+      }
+      room.lastActivityAt = Date.now()
+    }
     return had
   }
 
@@ -2225,6 +2234,24 @@ export class RoomStore {
     room.characters.set(char.playerId, stored)
     room.lastActivityAt = Date.now()
     return stored
+  }
+
+  /**
+   * 스탠딩을 뺀 정체성만 갱신(가벼운 발행). 같은 캐릭터를 계속 쓰는 중이면 보관 중인 스탠딩을 그대로 두고,
+   * 다른 캐릭터로 갈아입었으면 옛 스탠딩을 비운다(남겨 두면 무대에 엉뚱한 캐릭터의 그림이 선다).
+   * 비운 자리는 뒤이어 오는 char:update 가 채운다. 보관본이 아직 없으면 스탠딩 없는 상태로 새로 만든다.
+   */
+  mergeIdentity(roomId: string, ident: Omit<SharedCharacter, 'standings'>): SharedCharacter | undefined {
+    const room = this.rooms.get(roomId)
+    if (!room) return undefined
+    const prev = room.characters.get(ident.playerId)
+    const sameChar = !!prev && prev.charId === (capId(ident.charId) ?? '')
+    return this.setCharacter(roomId, {
+      ...ident,
+      standings: sameChar ? prev.standings : [],
+      // 표정은 남는 스탠딩 범위 안에서만 뜻이 있다 — 갈아입은 직후엔 0 으로(setCharacter 가 다시 보정).
+      currentExpression: sameChar ? ident.currentExpression : 0
+    })
   }
 
   /** 표정 인덱스만 갱신(잦은 변경). 보정된 인덱스 반환, 보관된 캐릭터 없으면 undefined. */
@@ -3448,7 +3475,12 @@ export class RoomStore {
       // 방 소유자는 그 방의 GM 이다(지금 접속 중이 아니어도 재입장하면 GM).
       const viewer = { playerId: accountId, role: room.participants.get(accountId)?.role ?? ('GM' as const) }
       const visible = room.messages.filter((m) =>
-        canSeeMessage(m, viewer, (gid) => this.canAccessChannel(room.id, gid, accountId))
+        canSeeMessage(
+          m,
+          viewer,
+          // 방장은 지금 접속 중이 아니어도 GM 이다 — 참가자 목록으로만 판정하면 자기 방 그룹 로그가 내보내기에서 빠진다.
+          (gid) => viewer.role === 'GM' || this.canAccessChannel(room.id, gid, accountId)
+        )
       )
       out.push(roomToFile({ ...room, messages: visible }))
     }

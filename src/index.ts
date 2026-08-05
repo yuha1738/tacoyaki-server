@@ -55,8 +55,8 @@ const sessionTtlMs = process.env.SESSION_TTL_DAYS
 const webRootCandidate = process.env.WEB_ROOT ? resolve(process.env.WEB_ROOT) : resolve('webdist')
 const webRoot = existsSync(join(webRootCandidate, 'index.html')) ? webRootCandidate : null
 
-// 운영: 계정·캐릭터·세션방 영속(<cwd>/data) + 로그인 필수. 누구나 방을 만들 수 있고 생성자가 그 방의 GM(소유자)이 된다.
-//   (자가호스팅 배포라 중앙 관리자가 없으므로 전역 admin 역할은 권한에 쓰지 않는다. role 필드는 호환용으로만 둔다.)
+// 운영: 계정·캐릭터·세션방 영속(<cwd>/data) + 로그인 필수. 멤버·관리자가 방을 만들 수 있고 생성자가 그 방의 GM(소유자)이 된다.
+//   (전역 등급 admin/member/guest 는 호스팅 용량 보호용 축이다 — 손님은 승인 전까지 방을 만들 수 없고, 관리 화면은 관리자만 연다.)
 // 세션방은 영속(소유자 삭제 전까지 유지) — 유휴 정리(sweep) 없음.
 const authStore = createAuthStore({ sessionTtlMs })
 const charStore = createCharacterStore()

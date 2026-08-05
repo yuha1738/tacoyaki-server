@@ -134,7 +134,7 @@ export interface JobShift {
   status: JobShiftStatus // 'done' 은 저장하지 않고 now>=endAt 으로 파생(아래 viewShift)
 }
 interface DailyState {
-  lastDate: string // 'YYYY-MM-DD'(서버 로컬). 같은 날 재수령 차단.
+  lastDate: string // 'YYYY-MM-DD'(UTC 기준 — dayStr 산출값). 같은 날 재수령 차단.
   streak: number
 }
 
