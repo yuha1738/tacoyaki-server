@@ -26,6 +26,8 @@ const MAX_COMMENT = 2000
 const MAX_COMMENT_IMAGES = 4
 const MAX_POSTS_PER_BOARD = 5000
 const MAX_WARNINGS = 8
+/** 한 글이 실어 보낼 수 있는 양식 칸 이름 개수 — 게시판 양식 상한(MAX_FORM_FIELDS)과 같은 크기로 둔다. */
+const MAX_FORM_KEYS = 40
 const MAX_REPORTS = 1000
 const MAX_REPORT_DETAIL = 500
 /** 본문 캐시 상한 — 넘으면 오래 안 쓴 것부터 내보낸다(더러운 것은 먼저 저장). */
@@ -162,6 +164,10 @@ export interface SaveInput {
   publishAt?: unknown
   charId?: unknown
   charName?: unknown
+  /** 게시판 양식에서 '본문(서식)' 으로 선언된 칸 이름들. 그 칸 값만 새니타이저를 통과시킨다. */
+  richFieldKeys?: unknown
+  /** 게시판 양식이 지금 쓰는 칸 이름 전부. 양식에서 사라진 칸의 값을 걷는 데 쓴다. */
+  formKeys?: unknown
 }
 
 /** 게시판 삭제 시 소속 글을 어떻게 할지 — 부르는 쪽이 반드시 정한다. */
@@ -187,6 +193,11 @@ function line(v: unknown, max: number): string {
 }
 function assetRef(v: unknown): string {
   return typeof v === 'string' && ASSET_RE.test(v.trim()) ? v.trim() : ''
+}
+/** 새니타이저를 통과한 본문에서 첫 그림의 자산 참조를 집는다(표지를 안 고른 글의 폴백). */
+function firstImageRef(html: string): string {
+  const m = /<img[^>]+src="(asset:[a-f0-9]{64})"/i.exec(html)
+  return m ? m[1] : ''
 }
 function num(v: unknown, lo: number, hi: number, def: number): number {
   if (typeof v !== 'number' || !Number.isFinite(v)) return def
@@ -269,6 +280,8 @@ export interface CommunityPostStore {
   remove(postId: string, actorId: string, now: number): Result<PostSummary>
   restore(postId: string, actorId: string, ownOnly: boolean): Result<PostSummary>
   trashList(): PostSummary[]
+  /** 삭제함 비우기 — 요약과 본문 파일을 함께 없앤다. 목록을 비우면 삭제함 전체. 돌이킬 수 없다. */
+  purgeTrash(postIds?: string[]): number
   /**
    * 게시판마다 가장 최근에 올라온 글의 시각.
    * 목록의 ●NEW 는 '내가 마지막으로 본 때'와 이 값을 견줘야 참말이 된다 —
@@ -542,11 +555,16 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
           }
 
       post.title = title
-      post.html = html
+      // 본문을 아예 안 실어 보낸 요청(메타만 고치는 저장)은 있던 본문을 지우지 않는다.
+      // 양식의 본문 칸 이름이 바뀌어 값이 비어 오는 경우가 여기 걸린다 — 안 거르면 전문이 통째로 날아간다.
+      if (typeof input.html === 'string') post.html = html
       post.prefix = line(input.prefix, 20)
       post.tags = strList(input.tags, MAX_TAG, MAX_TAGS)
       post.cast = strList(input.cast, 64, MAX_CAST)
-      post.cover = assetRef(input.cover)
+      // 표지를 안 골랐으면 본문·모음의 첫 그림을 대신 세운다 — 목록 타일이 빈칸으로 남지 않게.
+      // 단 '표지 없음'을 명시해 보냈으면(빈 문자열) 그 뜻을 지킨다 — 안 그러면 지운 표지가 곧바로 되살아난다.
+      const wantsCover = typeof input.cover === 'string' ? !!input.cover.trim() : true
+      post.cover = wantsCover ? assetRef(input.cover) || firstImageRef(post.html) || assetList(input.gallery, 1)[0] || '' : ''
       post.gallery = assetList(input.gallery, MAX_GALLERY)
       post.bgm = normBgm(input.bgm)
       post.hasBgm = !!post.bgm
@@ -559,12 +577,21 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       post.charId = line(input.charId, 64)
       post.charName = line(input.charName, 40)
       // 구조화 칸은 게시판 양식이 정하므로 여기서는 형태만 지킨다(문자열·문자열 배열·불리언·숫자).
-      post.fields = {}
+      // 보낸 칸만 덮어쓴다 — 통째로 비우면 양식에서 칸 이름이 바뀌었을 때 예전 값이 영영 사라진다.
+      const rich = new Set(strList(input.richFieldKeys, 40, MAX_FORM_KEYS))
+      // 다만 양식에서 아주 빠진 칸은 걷는다. 안 걷으면 화면에 안 보이는 값이 글에 영원히 쌓이고,
+      // 그 값이 붙잡은 그림도 자산 회수에서 살아남아 영영 안 지워진다.
+      const known = strList(input.formKeys, 40, MAX_FORM_KEYS)
+      if (known.length) {
+        const keep = new Set([...known, ...Object.keys(input.fields && typeof input.fields === 'object' ? input.fields : {})])
+        for (const k of Object.keys(post.fields)) if (!keep.has(k)) delete post.fields[k]
+      }
       if (input.fields && typeof input.fields === 'object') {
         for (const [k, v] of Object.entries(input.fields as Record<string, unknown>)) {
           const key = line(k, 40)
           if (!key) continue
-          if (typeof v === 'string') post.fields[key] = v.slice(0, 4000)
+          // 서식 칸은 본문과 같은 화이트리스트를 거쳐야 한다 — 이 값도 화면에서 HTML 로 그려진다.
+          if (typeof v === 'string') post.fields[key] = rich.has(key) ? sanitizePostHtml(v.slice(0, MAX_HTML)) : v.slice(0, 4000)
           else if (typeof v === 'number' || typeof v === 'boolean') post.fields[key] = v
           else if (Array.isArray(v)) post.fields[key] = v.slice(0, 60).map((x) => (typeof x === 'string' ? x.slice(0, 500) : '')).filter(Boolean)
         }
@@ -630,6 +657,33 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       const out: PostSummary[] = []
       for (const b of boards.values()) for (const s of b.summaries) if (s.deletedAt) out.push(s)
       return out.sort((a, b) => b.deletedAt - a.deletedAt)
+    },
+
+    purgeTrash(postIds) {
+      // 지정한 것만 지운다. 빈 목록이 오면 삭제함에 있는 것 전부.
+      const only = postIds && postIds.length ? new Set(postIds) : null
+      let n = 0
+      for (const [bid, b] of boards) {
+        const keep: PostSummary[] = []
+        for (const s of b.summaries) {
+          if (s.deletedAt && (!only || only.has(s.id))) {
+            bodies.delete(s.id)
+            if (persist) {
+              try {
+                unlinkSync(join(postDir, `${s.id}.json`))
+              } catch {
+                /* 이미 없음 */
+              }
+            }
+            n++
+          } else keep.push(s)
+        }
+        if (keep.length !== b.summaries.length) {
+          b.summaries = keep
+          saveBoard(bid)
+        }
+      }
+      return n
     },
 
     purgeExpired(now) {

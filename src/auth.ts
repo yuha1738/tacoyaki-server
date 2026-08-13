@@ -473,6 +473,10 @@ function lobbySnapshotIsBlank(l: LobbySnapshot): boolean {
     Object.keys(l.iconSizes ?? {}).length === 0 &&
     Object.keys(l.hiddenIcons ?? {}).length === 0 &&
     Object.keys(l.iconPos ?? {}).length === 0 &&
+    // 창을 열어 둔 배치도 '꾸민 것'이다(클라 snapshotLooksBlank 와 같은 규칙).
+    // ⚠ 'session' 은 새 로비의 기본값이라 세지 않는다 — 세면 빈 로비가 빈 것이 아니게 되어
+    //   빈 스냅샷 자동 발행 차단이 뚫린다(남의 화면에서 로비가 지워진 것처럼 보인다).
+    !Object.entries(l.widgets ?? {}).some(([k, w]) => k !== 'session' && w?.open) &&
     !(l.wallpaper?.color ?? '')
   )
 }
@@ -1338,7 +1342,7 @@ export function createAuthStore(opts?: {
         return { ok: false, error: '그림이 빠진 로비로 덮을 수 없습니다. 그림이 제대로 보이는 기기에서 보내 주세요.' }
       }
       // 내용이 하나도 없는 판이 왔다. 위 가드는 '그림이 있던 로비'만 지키므로, 글·디데이·일정만 있던
-      // 로비는 그대로 통과해 지워졌다(막 로그인한 빈 기기가 5초 뒤 자동으로 올린다).
+      // 로비는 그대로 통과해 지워진다(막 로그인한 빈 기기가 5초 뒤 자동으로 올린다).
       // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀을 때만(explicitEmpty) 비우기를 허용한다.
       if (a.lobby && !lobbySnapshotIsBlank(a.lobby) && lobbySnapshotIsBlank(clean) && !explicitEmpty) {
         return { ok: false, error: '내용이 비어 있는 로비로 덮을 수 없습니다. 비우려면 설정에서 직접 보내 주세요.' }
