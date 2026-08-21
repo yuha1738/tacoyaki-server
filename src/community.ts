@@ -174,13 +174,14 @@ export type FieldType =
   | 'image'
   | 'gallery'
   | 'tags'
+  | 'link'
   | 'bgm'
   | 'check'
   | 'confirm'
   | 'divider'
 const FIELD_TYPES: ReadonlySet<string> = new Set<FieldType>([
   'text', 'longtext', 'rich', 'number', 'select', 'multiselect',
-  'image', 'gallery', 'tags', 'bgm', 'check', 'confirm', 'divider'
+  'image', 'gallery', 'tags', 'link', 'bgm', 'check', 'confirm', 'divider'
 ])
 
 export interface FieldDef {
@@ -934,7 +935,7 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
       }
       auditCache = loadRecentAudit()
     } catch (e) {
-      console.error('[community] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 
